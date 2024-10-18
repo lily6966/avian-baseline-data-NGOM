@@ -1,0 +1,452 @@
+---
+title: "The Residual Confounding Toy Example Vignette for Trend Estimation with Double Machine Learning"
+output: html_vignette
+vignette: >
+  %\VignetteIndexEntry{The Residual Confounding Toy Example Vignette for Trend Estimation with Double Machine Learning}
+  %\VignetteEncoding{UTF-8}
+  %\VignetteEngine{knitr::rmarkdown}
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  warning = FALSE,
+  error = FALSE,
+  message = FALSE,
+  comment = "#>"
+)
+```
+
+This vignette works through the synthetic toy example presented in Supplemental Information Sections 3 of *A Double Machine Learning Trend Model for Citizen Science Data*. This example illustrates how residual confounding can be identified and adjusted when the propensity score model does not fully control for interannual confounding in the available features. To carry out this analysis, we generated fully synthetic data sets with known confounding and a propensity score model deliberately underfit so that it can only provide partial control for the confounding.
+
+In what follows, we describe the data generating process used to generate the synthetic toy data followed by a description of the Causal Forest implementation of the DML trend model used to estimate the trend for a single synthetic data set. A simulation study is presented to demonstrate expected performance across multiple realizations of the synthetic data sets.
+
+```{r setup}
+library(grf)
+library(dplyr)
+library(ggplot2)
+
+set.seed(1)
+```
+
+## Generating Synthetic Data {#data}
+
+Synthetic data generation is carried out in three steps:
+
+1. Feature sets are generated,
+2. Confounding dependence between the features and the survey year is introduced and used to generate the survey year, and
+3. The reported abundance is generated.
+
+### Feature sets {#data-features}
+
+The synthetic example consists of 100 surveys each year from 0 to 10 for a total sample size of 1100. Each survey is associated with three feature sets:
+
+- $H$ is a 1100 x 25 matrix consisting of 25 features describing the surveyed habitat.
+- $O$ is a 1100 x 25  matrix consisting of 25 features describing the observation process (e.g. search effort).
+- $W$ is a 1100 x 25  matrix consisting of 25 features describing potential sources of variation in the trend.
+
+The features for each set are each sampled independently from the uniform distribution, $Uniform([-0.5,0.5]^{p})$ with $p=25$ as follows,
+
+```{r data-features}
+n <- 1100
+p <- 25
+
+# habitat features
+H <- scale(matrix(runif(n * p), n, p), scale = FALSE)
+# search effort features
+O <- scale(matrix(runif(n * p), n, p), scale = FALSE)
+# trend features
+W <- scale(matrix(runif(n * p), n, p), scale = FALSE)
+```
+
+### Confounding {#data-confounding}
+
+We created two confounding sources of interannual variation in the observation process where participants (1) selected sites with more habitat type $h_{1}$, and (2) spent increasing amounts of effort $o_{1}$ searching for species at later times. This is done by framing the dependence of the survey time $\tilde{T}$ on the confounded features, 
+
+$$
+\tilde{T} = h_{1} + o_{1} + \delta
+$$
+
+where the error term $\delta \sim N(0,1)$. The continuous time variable $\tilde{T}$ is transformed into the discrete survey year variable $T=0,…,10$ using empirical quantiles, below. 
+
+Although it might seem more natural to think about the confounding features being dependent on the survey year, framing the dependence as presented here is practically advantageous because it is straightforward to generate complex patterns of interannual confounding with multiple, simultaneous drivers. 
+
+```{r data-confounding}
+start_year <- 0
+end_year <- 10
+
+# continuous year, link-scale
+T_tilde <- H[, 1] + O[, 1] + rnorm(n, mean = 0, sd = 1)
+
+# transform to integer year using quantiles of the continuous year
+n_per_year <- n / (end_year - start_year + 1)
+T <- (rank(T_tilde) - 1) %/% n_per_year + start_year
+```
+
+### Abundance {#data-abundance}
+
+In this example, participants reported the log abundance $Y_i$ on the $i^{th}$ survey according to the following response model,
+
+$$
+Y_{i} = \alpha_{0} + 
+\sum_{j=1}^{J} \alpha_{j} h_{ji} + 
+\sum_{j=1}^{J} \beta_{j} o_{ji} +
+T_{i} \left( \tau_{0} + \sum_{j=1}^{J} \tau_{j} w_{ji} \right) +
+\epsilon_{i},
+$$
+
+where $h_{ji}$ was the $j^{th}$ habitat feature, $o_{ji}$ was the $j^{th}$ observation process feature, $w_{ij}$ was the $j^{th}$ species population trend feature, $T_{i}$ was the year of the $i^{th}$ survey, where $i=(1,...,N)$, $j=(1,...,J)$ and $\epsilon \sim N(0,1)$.
+
+For simplicity, all but three of the parameters, $(\alpha_{1}=10, \beta_{1}=10, \tau_{0}=-0.05)$, were set to zero. Consequently, the reported abundance increases with increasing amounts of habitat type 1 ($h_{1}$) in the survey area but is not affected by any of the other 24 habitat types. Similarly, only one observation feature affects the reported abundance. There is an overall trend in the species population size $\tau_0$, but none of the 25 trend features W affect the trend. This means the trend is homogeneous in $W$. 
+
+The parameters $\alpha$, $\beta$, and $\tau$, generate data sets with moderate confounding where the inter-annual variation in the population size was relatively small compared to the intra-annual variation.
+
+We generate the reported abundance on each survey using the following code,
+
+```{r data-abundance}
+# per year rate of change in abundance index
+tau <- -0.05
+
+# reported abundance for each survey
+Y <- 10 * H[, 1] + 10 * O[, 1] + tau * (T - mean(T))
+# add error term
+Y <- Y + rnorm(length(Y), mean = 0, sd = 1)
+```
+
+Now we can encapsulate the three data generation steps in a function that generates synthetic survey data,
+
+```{r data-generate}
+# simulate reported abundance on surveys
+simulate_abundance <- function(tau,
+                               H, O, W, T,
+                               outcome_effect = 10,
+                               outcome_sd = 1) {
+  # reported abundance for each survey
+  Y <- outcome_effect * (H[, 1] + O[, 1]) + tau * (T - mean(T))
+  # add error term
+  Y <- Y + rnorm(length(Y), mean = 0, sd = outcome_sd)
+  return(Y)
+}
+
+# generate synthetic survey data
+# including feature sets, year assignment, and reported abundance
+generate_survey_data = function(n = 1100,
+                                p = 25,
+                                start_year = 0,
+                                end_year = 10,
+                                tau = -0.05,
+                                selection_effect = 1, selection_sd = 1,
+                                outcome_effect = 10, outcome_sd = 1) {
+  # habitat features
+  H <- scale(matrix(runif(n * p), n, p), scale = FALSE)
+  # search effort features
+  O <- scale(matrix(runif(n * p), n, p), scale = FALSE)
+  # trend features
+  W <- scale(matrix(runif(n * p), n, p), scale = FALSE)
+  
+  # introduce confounding
+  # continuous year, link-scale
+  T_tilde <- selection_effect * (H[, 1] + O[, 1])
+  # add error term
+  T_tilde <- T_tilde + rnorm(n, mean = 0, sd = selection_sd)
+  
+  # transform to integer year using quantiles of the continuous year
+  n_per_year <- n / (end_year - start_year + 1)
+  T <- (rank(T_tilde) - 1) %/% n_per_year + start_year
+  
+  # simulate abundance
+  Y  <- simulate_abundance(tau = tau,
+                           H = H, O = O, W = W, T = T,
+                           outcome_effect = outcome_effect,
+                           outcome_sd = outcome_sd)
+  
+  return(list(O = O,
+              H = H,
+              W = W,
+              T = T,
+              Y = Y,
+              tau = tau,
+              selection_effect = selection_effect,
+              outcome_effect = outcome_effect,
+              selection_sd = selection_sd,
+              outcome_sd = outcome_sd))
+}
+
+# generate one realization of survey data
+survey_data <- generate_survey_data()
+```
+
+### Visualizing the simulated data {#data-visualize}
+
+The responses $Y$ reflect the combined effects of the declining trend $\tau_{0}$ (shown in [**orange**]{style="color:#ff8c00"}) in the species' population abundance and the increasing trends in survey coverage and search effort, both positively associated with reported abundance. The figure also shows how small the inter-annual variation in the species population size is compared to the overall intra-annual variation. This highlights the challenge of accurately estimating the species population trend $\tau_{0}$ in this example.
+
+```{r fig1a, fig.width=21, fig.height=15, out.width='100%'}
+# slope and intercept for true simulated trend line
+# assuming the abundance index is 0 for the middle year
+true_slope <- survey_data$tau
+true_intercept <- mean(survey_data$Y) - survey_data$tau * mean(survey_data$T)
+
+# plot true and observed trend
+ggplot(data = data.frame(x = survey_data$T, y = survey_data$Y)) +
+  aes(x = T, y = Y) +
+  geom_jitter(aes(size = 90), width = 0.25, alpha = 0.5) +
+  geom_hline(yintercept = 0, linewidth = 1) +
+  # true trend line
+  geom_abline(intercept = true_intercept, 
+              slope = true_slope, 
+              color = "#ff8c00", linewidth = 3) +
+  scale_x_continuous(breaks = seq(start_year, end_year)) +
+  labs(x = "Year", y = "Log Abundance") +
+  theme_bw() +
+  theme(legend.position = "none", 
+        axis.text = element_text(size = 24), 
+        axis.title = element_text(size = 36))
+```
+
+## Trend estimation with causal forests {#train}
+
+Using the simulated data from the previous section, we estimate the population trend using Causal Forests, an implementation of DML based on random forests, from the [`grf` package](https://github.com/grf-labs/grf). The Casual Forest model is trained in three steps, fitting the three sub-models: 
+
+1.  **Propensity score model $s(X)$:** estimate the propensity scores using a regression forest. This model is trained using responses (or labels) $T$ and the 50 habitat and observation process features ($X = (H,O)$).
+2.  **Conditional mean model $m(X)$:** estimate the expected abundance averaged across years $T$ using a regression forest. This is done by training the model with responses $Y$ with the 50 habitat and observation process features ($X = (H,O)$), but excluding (or permuting) information about $T$.  
+3.  **Trend model $\tau(W)$:** estimate the trends in abundance using a causal forest. The causal forest uses another regression forest to solve the residual-on-residual regression in Equation 4 of the main paper using the 25 trend features $W$. 
+
+Our goal is to illustrate how residual confounding can be identified and then used to adjust the trend estimate. To do this we deliberately underfit the propensity model to ensure that there is residual confounding. This is done by using 100 trees and default parameter settings for all three random forest models
+
+To assess how much confounding control the propensity score adjustment provides, we performed an ablation study fitting a second causal forest model *without* adjusting for the propensity scores. This is achieved by plugging in a constant value (here, the mean propensity score across all surveys) for the propensity scores values in the residual-on-residual regression in Equation 4 of the main paper.  
+
+We'll encapsulate the model training code in a function so we can call it repeatedly throughout this vignette.
+
+```{r warmup-train}
+train_cf <- function(data, 
+                     # number of trees to use for random forest
+                     n_trees = 100,
+                     # number of threads used by grf to train the models
+                     n_threads = parallel::detectCores()) {
+  
+  # step 1: train propensity score model
+  forest_W <- regression_forest(X = cbind(data$H, data$O), 
+                                Y = data$T,
+                                num.trees = n_trees, 
+                                num.threads = n_threads)
+  # estimate of propensity scores
+  W_hat <- predict(forest_W)$predictions
+  
+  # step 2: train conditional mean model
+  forest_Y <- regression_forest(X = cbind(data$H, data$O), 
+                                Y = data$Y, 
+                                num.trees = n_trees, 
+                                num.threads = n_threads)
+  # estimate of expected abundance marginalized over year
+  Y_hat <- predict(forest_Y)$predictions
+  
+  # step 3: train trend model
+  tau_forest <- causal_forest(X = data$W,
+                              # reported abundance 
+                              Y = data$Y, 
+                              # mean abundance from 2
+                              Y.hat = Y_hat, 
+                              # year and propensity score from 1
+                              W = data$T, W.hat = W_hat,
+                              num.trees = n_trees, 
+                              num.threads = n_threads)
+  
+  # estimate mean trend and uncertainty averaged over feature set W
+  ate <- average_treatment_effect(tau_forest)
+  
+  # train a trend model without the propensity score adjustment
+  tau_forest_wops <- causal_forest(X = data$W, 
+                                   Y = data$Y, 
+                                   Y.hat = Y_hat, 
+                                   W = data$T, 
+                                   # plug in constant value, mean propensity score
+                                   W.hat = mean(W_hat),
+                                   num.trees = n_trees, 
+                                   num.threads = n_threads)
+  
+  # estimate mean trend and uncertainty averaged over feature set W
+  ate_wops <- average_treatment_effect(tau_forest_wops)
+  
+  # combine results
+  estimates <- data.frame(type = c("with_ps", "without_ps"),
+                          trend_mean = c(ate[[1]], ate_wops[[1]]),
+                          trend_se = c(ate[[2]], ate_wops[[2]]))
+  
+  return(estimates)
+}
+
+# estimates of per year rate of change in abundance index, i.e. the trend
+# with_ps: causal forest trained using propensity score adjustment
+# without_ps: causal forest trained without the propensity score adjustment
+train_cf(survey_data)
+```
+
+
+
+Recall that the true trend we're trying to estimate with the causal forest model is $\tau=-0.05$. Without the propensity score adjustment (`type == "without_ps"` above), the model predicted an increasing trend. Including the propensity score adjustment in the causal forest model (`type == "with_ps"`) reduced but did not completely remove helps control for tthe interannual confounding bias.
+
+## Residual confounding {#residual}
+
+Here we implement the RC diagnostic described in Section 2.2 of the main paper to assess the effectiveness of the propensity score model.
+
+The approach presented in Section 2.2 is a fully data-driven simulation-based diagnostic that can be computed for any DML model. Recognizing that the conditional mean model estimated in Equation (3) $\hat{m}(X)$ is a zero or null-trend model, we use it to generate responses $Y^{*}$ conditional on features $\{ X^{*},W^{*},T^{*} \}$. Synthetic feature sets are generated by sampling $\{ X^{*},W^{*},T^{*} \}$ with replacement, stratified by year to maintain interannual variation. This approach has the benefits of generating realistic feature sets with zero trend that maintain the joint distribution of the features, interannual variation in the features, and year-invariant patterns of variation in abundance associated with $X$ while avoiding extrapolation in the feature space or additional assumptions (beyond those of the DML) about unknown trends.
+
+```{r residual-null}
+generate_null_trend_model_data <- function(data) {
+  # resample each year with replacement
+  sample_index <-  NULL
+  for (y in sort(unique(data$T))){
+    nindex <- which(data$T == y)
+    sample_index <- c(sample_index,
+                      sample(nindex, size = length(nindex), replace= TRUE))
+  }
+  
+  # shuffle features
+  O <- data$O[sample_index, ]
+  H <- data$H[sample_index, ]
+  W <- data$W[sample_index, ]
+  Y <- data$Y[sample_index]
+  T <- data$T[sample_index]
+  
+  # generate abundance from conditional mean model
+  forest_Y <- regression_forest(X = cbind(H, O), 
+                                Y = Y,
+                                num.trees = 100,
+                                num.threads = parallel::detectCores())  
+  Y_pred <- predict(forest_Y)$predictions
+  
+  # add residual noise via parametric bootstrap 
+  data$outcome_sd <- sd(Y_pred - Y)  
+  Y <- Y_pred + rnorm(length(Y), mean = 0, sd = data$outcome_sd) 
+  
+  return(list(O = O,
+              H = H,
+              W = W,
+              T = T,
+              Y = Y,
+              tau = 0,
+              selection_effect = data$selection_effect,
+              outcome_effect = data$outcome_effect,
+              selection_sd = data$selection_sd,
+              outcome_sd = data$outcome_sd))
+}
+
+# generate a single realization of null model data
+null_data <- generate_null_trend_model_data(survey_data)
+```
+
+Next, we use the causal forest trend model to estimate the trend for the simulated survey data with $\tau=-0.05$ and the null model with $\tau=0$.
+
+```{r residual-train}
+trend_estimates <- train_cf(survey_data) %>% 
+  # for this example we only want the estimates that use the propensity score
+  filter(type == "with_ps")
+null_model_estimates <- train_cf(null_data) %>% 
+  # for this example we only want the estimates that use the propensity score
+  filter(type == "with_ps")
+```
+
+The difference between the known and estimated trend for the null model can be used to assess the magnitude of residual confounding and adjust the trend estimate.
+
+```{r residual-adjust}
+# trend estimate without adjusting for residual confounding
+# NOTE: this estimate is different from the estimate in the previous section 
+# because of the randomization inherent in the random and causal forests
+trend_estimates$trend_mean
+
+# residual confounding adjustment: estimated - simulated trend
+# note that the simulated trend is zero here, so we don't need to subtract it
+(adjustment <- null_model_estimates$trend_mean)
+
+# trend estimate with residual confounding adjustment
+trend_estimates$trend_mean - adjustment
+```
+
+Recall that the true trend we’re trying to estimate is $\tau=-0.05$. With the propensity score adjustment in the causal forest model the trend estimate was approximately zero. The residual confounding adjustment helped to reduce the confounding bias producing a trend estimate of `r round(trend_estimates$trend_mean - adjustment, 3)`.
+
+## Simulations {#sim}
+
+Here we perform the simulation presented in the Supplemental Information Section 3. We simulate 100 datasets and estimate the trend with no adjustment, with the propensity score adjustment, and with both the propensity score adjustment and the residual confounding adjustment.
+
+```{r sim-residual, eval=FALSE}
+# number of monte carlo trials for the simulation
+# note: using the 100 trials will require 5 minutes to process
+n_mc <- 100
+
+trend_estimates_mc <- NULL
+for (i in seq_len(n_mc)) {
+  # provide progress every 10 iterations
+  if (i %% 10 == 0) {
+    message("i = ", i)
+  }
+  
+  # data generation
+  survey_data <- generate_survey_data()
+  null_data <- generate_null_trend_model_data(survey_data)
+  
+  # train causal forest with and without propensity score
+  cf_estimates <- train_cf(survey_data) %>% 
+    mutate(mc = i, .before = 1)
+  
+  # residual confounding adjustment
+  cf_estimates_null <- train_cf(null_data) %>% 
+    filter(type == "with_ps")
+  rc_adjustment_mean <- cf_estimates_null$trend_mean
+  rc_adjustment_se <- cf_estimates_null$trend_se
+  cf_estimates <- cf_estimates %>% 
+    filter(type == "with_ps") %>% 
+    mutate(type = "with_rc_adjustment",
+           trend_mean = trend_mean - rc_adjustment_mean,
+           # propagate the combined error of trend estimate and residual confounding 
+           # assuming independence as an approximation 
+           trend_se = sqrt(trend_se^2 + rc_adjustment_se^2)) %>% 
+    rbind(cf_estimates)
+  
+  trend_estimates_mc <- rbind(trend_estimates_mc, cf_estimates)
+}
+```
+
+```{r echo=FALSE, include=FALSE}
+f_cache <- here::here("vignettes_cache/trend_estimates_mc.csv")
+# write.csv(trend_estimates_mc, f_cache, row.names = FALSE, na = "")
+trend_estimates_mc <- read.csv(f_cache, na = "")
+```
+
+We plot density plots comparing the trend estimates without any correction for confounding (in [**purple**]{style="color:#7f00ff"}), trend estimates with the propensity score adjustment (in [**dark blue**]{style="color:#00008b"}), trend estimates with the propensity score and the residual confounding adjustment (in [**light blue**]{style="color:#add8e6"}) with the ([**orange**]{style="color:#ff8c00"}) vertical line showing the simulated trend at -0.05.
+
+```{r fig1b, fig.width=21, fig.height=15, out.width='100%'}
+ggplot(trend_estimates_mc) +
+  aes(x = trend_mean, color = type, fill = type) +
+  geom_density(alpha = 0.6) +
+  geom_hline(yintercept = 0) +
+  geom_vline(xintercept = 0) +
+  geom_vline(xintercept = survey_data$tau,
+             color = "#ff8c00", linewidth = 2) +
+  scale_color_manual(
+    values = c("#7f00ff", "#00008b", "#add8e6"),
+    breaks = c("without_ps", "with_ps", "with_rc_adjustment"),
+    aesthetics = c("colour", "fill")) +
+  lims(x = c(-0.105, 0.068),
+       y = c(0, 40)) +
+  labs(x = "Trend Estimates", y = "Density") +
+  theme_bw() +
+  theme(legend.position = "none", panel.grid = element_blank(),
+        axis.text = element_text(size = 24), 
+        axis.title = element_text(size = 36))
+```
+
+We calculate coverage, i.e. the proportion of the 95% confidence intervals that covered the true trend $\tau$, assuming that the trend estimates for real and simulated data were independent. The standard errors of both trend estimates were computed using Causal Forests estimates of the standard error of the mean trend, averaged across $W$.
+
+```{r sim-residual-coverage}
+estimates_adjusted <- filter(trend_estimates_mc, 
+                             type == "with_rc_adjustment")
+
+# 95% confidence intervals
+ul <- estimates_adjusted$trend_mean + 1.96 * estimates_adjusted$trend_se
+ll <- estimates_adjusted$trend_mean - 1.96 * estimates_adjusted$trend_se
+
+# calculate coverage
+mean(survey_data$tau > ll & survey_data$tau < ul)
+```
